@@ -1,11 +1,12 @@
 import Dashboard from "./Dashboard";
 import VentasAdmin from "./VentasAdmin";
 import { useProductos } from "../hooks/useProductos";
-import { useTurnos, toIsoDate, slotAvailable } from "../hooks/useTurnos";
+import { useTurnos, toIsoDate, slotAvailable, generarSlotsDelDia } from "../hooks/useTurnos";
 import { useCatalogo, esFeriadoFijo, type Servicio, type Feriado } from "../hooks/useCatalogos";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Package, Plus, Edit, Trash2, Search, Calendar, Clock, ChevronLeft, ChevronRight, CheckCircle, User, Users, PawPrint, Image, X, ChevronDown, ChevronUp } from "lucide-react";
 import { useAuth, Client } from "../context/AuthContext";
+import { obtenerDiasAtencion, obtenerTurnosDisponibles, type DiaAtencion } from "../../service/api";
 
 interface Product {
   id: number;
@@ -116,6 +117,13 @@ export default function AdminPanel() {
   const [apptError,setApptError]=useState('');
   const [apptSaving,setApptSaving]=useState(false);
   const [apptSuccess, setApptSuccess] = useState(false);
+  const [diasAtencion, setDiasAtencion] = useState<DiaAtencion[]>([]);
+
+  useEffect(() => {
+    obtenerDiasAtencion().then(data => {
+      if (Array.isArray(data) && data.length > 0) setDiasAtencion(data);
+    }).catch(console.error);
+  }, []);
 
   const getDaysInMonth = (date: Date) => {
     const year = date.getFullYear();
@@ -129,20 +137,50 @@ export default function AdminPanel() {
   };
 
   const isDateAvailable = (day: number) => {
-  const d = new Date(
-    apptMonth.getFullYear(),
-    apptMonth.getMonth(),
-    day
-  );
+    const d = new Date(
+      apptMonth.getFullYear(),
+      apptMonth.getMonth(),
+      day
+    );
+    const diaSemana = d.getDay();
+    const configDia = diasAtencion.find(da => da.numero_dia === diaSemana);
+    const diaHabilitado = configDia !== undefined ? Boolean(configDia.activo) : diaSemana !== 0;
 
-  return d >= today && d <= twoMonthsLater && !esFeriado(d);
+    return d >= today && d <= twoMonthsLater && !esFeriado(d) && diaHabilitado;
   };
 
-  const getTimeSlots = (): TimeSlot[] => {
-    const slots = ["09:00","09:30","10:00","10:30","11:00","11:30","12:00","12:30","14:00","14:30","15:00","15:30","16:00","16:30","17:00","17:30","18:00","18:30"];
-    const selected=servicios.find(s=>s.descripcion===apptService);
-    return slots.map(t => ({time:t,available:slotAvailable(apptDate?toIsoDate(apptDate):'',t,selected?.duracion_minutos||0,appointments)}));
-  };
+  const [apptAvailableSlots, setApptAvailableSlots] = useState<string[]>([]);
+  const [apptLoadingSlots, setApptLoadingSlots] = useState(false);
+
+  useEffect(() => {
+    if (!apptDate) {
+      setApptAvailableSlots([]);
+      return;
+    }
+    const isoDate = toIsoDate(apptDate);
+    if (!isoDate) {
+      setApptAvailableSlots([]);
+      return;
+    }
+
+    const selected = servicios.find(s => s.descripcion === apptService);
+    setApptLoadingSlots(true);
+
+    obtenerTurnosDisponibles(isoDate, selected?.id_servicio)
+      .then(slots => {
+        setApptAvailableSlots(slots);
+        if (apptTime && !slots.includes(apptTime)) {
+          setApptTime(null);
+        }
+      })
+      .catch(err => {
+        console.error(err);
+        setApptAvailableSlots([]);
+      })
+      .finally(() => {
+        setApptLoadingSlots(false);
+      });
+  }, [apptDate, apptService, appointments, servicios]);
 
   const handleApptBooking = async () => {
     if (!apptClient || !apptPet || !apptService || !apptDate || !apptTime || apptSaving) return;
@@ -347,15 +385,23 @@ export default function AdminPanel() {
               </div>
               {apptDate && (
                 <div className="mt-5">
-                  <h3 className="text-gray-900 mb-3 flex items-center gap-2"><Clock className="w-4 h-4" />Horarios — {apptDate}</h3>
-                  <div className="grid grid-cols-4 gap-2">
-                    {getTimeSlots().map(slot => (
-                      <button key={slot.time} onClick={() => slot.available && setApptTime(slot.time)} disabled={!slot.available}
-                        className={`px-2 py-1.5 rounded-lg text-sm transition-colors ${!slot.available ? "bg-gray-200 text-gray-400 cursor-not-allowed" : apptTime === slot.time ? "bg-green-600 text-white" : "bg-gray-100 hover:bg-gray-200 text-gray-900"}`}>
-                        {slot.time}
-                      </button>
-                    ))}
-                  </div>
+                  <h3 className="text-gray-900 mb-3 flex items-center gap-2"><Clock className="w-4 h-4 text-blue-600" />Horarios Disponibles — {apptDate}</h3>
+                  {apptLoadingSlots ? (
+                    <p className="text-sm text-gray-500 py-2">Consultando horarios...</p>
+                  ) : apptAvailableSlots.length > 0 ? (
+                    <div className="grid grid-cols-4 gap-2">
+                      {apptAvailableSlots.map(time => (
+                        <button key={time} onClick={() => setApptTime(time)}
+                          className={`px-2 py-1.5 rounded-lg text-sm transition-colors font-medium ${apptTime === time ? "bg-green-600 text-white shadow-sm" : "bg-blue-50 hover:bg-blue-100 text-blue-900 border border-blue-200"}`}>
+                          {time}
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-sm text-amber-700 bg-amber-50 p-2.5 rounded-lg border border-amber-200">
+                      No hay horarios disponibles en esta fecha.
+                    </p>
+                  )}
                 </div>
               )}
             </div>

@@ -443,6 +443,129 @@ app.get('/api/turnos', async (req,res) => {
     res.json(rows);
   } catch(e){console.error(e);res.status(500).json({error:'No se pudieron cargar turnos'});}
 });
+
+// Consulta de horarios disponibles para una fecha y servicio específico (descartando los ocupados por duración)
+app.get('/api/turnos/disponibles', async (req, res) => {
+  const { fecha, id_servicio } = req.query;
+
+  if (!fecha || !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+    return res.status(400).json({ error: 'Parámetro fecha inválido o requerido (formato: YYYY-MM-DD)' });
+  }
+
+  const conn = db.promise();
+  try {
+    // 1. Duración del servicio
+    let duracion = 30;
+    if (id_servicio && Number(id_servicio) > 0) {
+      const [servicios] = await conn.query(
+        'SELECT duracion_minutos, descripcion FROM servicio WHERE id_servicio = ?',
+        [Number(id_servicio)]
+      );
+      if (servicios.length > 0) {
+        duracion = Number(servicios[0].duracion_minutos) || 30;
+      }
+    }
+
+    // 2. Feriados fijos
+    const diaMes = `${fecha.slice(8, 10)}-${fecha.slice(5, 7)}`;
+    const [feriados] = await conn.query('SELECT id_feriado FROM feriados WHERE dia_mes = ?', [diaMes]);
+    if (feriados.length > 0) {
+      return res.json({ fecha, id_servicio: id_servicio ? Number(id_servicio) : null, duracion, disponibles: [] });
+    }
+
+    // 3. Configuración del día de atención
+    const diasSemanaNombres = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+    const diaIndex = new Date(`${fecha}T00:00:00`).getDay();
+    const diaNombre = diasSemanaNombres[diaIndex];
+
+    const [diasConfig] = await conn.query(
+      'SELECT activo, hora_apertura, hora_cierre FROM dias_atencion WHERE dia_semana = ?',
+      [diaNombre]
+    );
+
+    if (!diasConfig.length || !diasConfig[0].activo) {
+      return res.json({ fecha, id_servicio: id_servicio ? Number(id_servicio) : null, duracion, disponibles: [] });
+    }
+
+    const { hora_apertura, hora_cierre } = diasConfig[0];
+    const [hIni, mIni] = String(hora_apertura).slice(0, 5).split(':').map(Number);
+    const [hFin, mFin] = String(hora_cierre).slice(0, 5).split(':').map(Number);
+    const iniMin = hIni * 60 + mIni;
+    const finMin = hFin * 60 + mFin;
+    const paso = 30;
+
+    // 4. Turnos ocupados en esa fecha (cualquier servicio activo ocupa la atención)
+    const [turnosOcupados] = await conn.query(`
+      SELECT DATE_FORMAT(t.fecha_hora, '%H:%i') AS hora, s.duracion_minutos, s.descripcion
+      FROM turnos t
+      JOIN servicio s ON s.id_servicio = t.id_servicio
+      WHERE t.estado = 'activo'
+        AND DATE(t.fecha_hora) = ?
+    `, [fecha]);
+
+    const ocupadosRangos = turnosOcupados.map(t => {
+      const [th, tm] = t.hora.split(':').map(Number);
+      const start = th * 60 + tm;
+      const end = start + (Number(t.duracion_minutos) || 30);
+      return { start, end };
+    });
+
+    // 5. Generar slots libres
+    const disponibles = [];
+    for (let slotMin = iniMin; slotMin + duracion <= finMin; slotMin += paso) {
+      const slotEnd = slotMin + duracion;
+      const colisiona = ocupadosRangos.some(t => slotMin < t.end && t.start < slotEnd);
+
+      if (!colisiona) {
+        const hh = String(Math.floor(slotMin / 60)).padStart(2, '0');
+        const mm = String(slotMin % 60).padStart(2, '0');
+        disponibles.push(`${hh}:${mm}`);
+      }
+    }
+
+    res.json({
+      fecha,
+      id_servicio: id_servicio ? Number(id_servicio) : null,
+      duracion,
+      disponibles
+    });
+  } catch (e) {
+    console.error('Error al calcular turnos disponibles:', e);
+    res.status(500).json({ error: 'Error al calcular los turnos disponibles' });
+  }
+});
+
+// Función utilitaria para validar que la fecha y hora solicitadas correspondan a un día activo y dentro del horario
+async function validarHorarioAtencion(conn, fecha, hora, duracionMinutos) {
+  const diasSemanaNombres = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+  const diaIndex = new Date(`${fecha}T00:00:00`).getDay();
+  const diaNombre = diasSemanaNombres[diaIndex];
+
+  const [diasConfig] = await conn.query(
+    'SELECT activo, hora_apertura, hora_cierre FROM dias_atencion WHERE dia_semana = ?',
+    [diaNombre]
+  );
+  if (!diasConfig.length || !diasConfig[0].activo) {
+    return { ok: false, error: `La veterinaria no atiende los días ${diaNombre.toLowerCase()}s` };
+  }
+
+  const { hora_apertura, hora_cierre } = diasConfig[0];
+  const horaTurnoMin = Number(hora.slice(0, 2)) * 60 + Number(hora.slice(3, 5));
+  const [hIni, mIni] = String(hora_apertura).slice(0, 5).split(':').map(Number);
+  const [hFin, mFin] = String(hora_cierre).slice(0, 5).split(':').map(Number);
+  const iniMin = hIni * 60 + mIni;
+  const finMin = hFin * 60 + mFin;
+
+  if (horaTurnoMin < iniMin || horaTurnoMin + duracionMinutos > finMin) {
+    return {
+      ok: false,
+      error: `Horario fuera de atención para el ${diaNombre} (horario: ${String(hora_apertura).slice(0, 5)} a ${String(hora_cierre).slice(0, 5)})`
+    };
+  }
+
+  return { ok: true };
+}
+
 app.post('/api/turnos', async(req,res)=>{
   const {id_mascota,id_servicio,fecha,hora,motivo}=req.body||{};
   if(!Number(id_mascota)||!Number(id_servicio)||!/^\d{4}-\d{2}-\d{2}$/.test(fecha||'')||!/^\d{2}:\d{2}$/.test(hora||''))
@@ -460,20 +583,24 @@ app.post('/api/turnos', async(req,res)=>{
     if(!pets.length) {await conn.rollback();return res.status(400).json({error:'Mascota inexistente'});}
     const [holiday]=await conn.query('SELECT id_feriado FROM feriados WHERE dia_mes=?',[`${fecha.slice(8,10)}-${fecha.slice(5,7)}`]);
     if(holiday.length) {await conn.rollback();return res.status(409).json({error:'No se reservan turnos en feriados fijos'});}
+
+    // Validación de día y horario de atención
+    const valHorario = await validarHorarioAtencion(conn, fecha, hora, duration);
+    if (!valHorario.ok) {
+      await conn.rollback();
+      return res.status(400).json({ error: valHorario.error });
+    }
+
     const [conflicts]=await conn.query(`SELECT t.id_turno FROM turnos t JOIN servicio s ON s.id_servicio=t.id_servicio
       WHERE t.estado='activo' AND t.fecha_hora < DATE_ADD(?,INTERVAL ? MINUTE)
         AND DATE_ADD(t.fecha_hora,INTERVAL s.duracion_minutos MINUTE) > ?
-        AND (LOWER(TRIM(s.descripcion)) IN ('baño','bano')) =
-            (SELECT LOWER(TRIM(descripcion)) IN ('baño','bano') FROM servicio WHERE id_servicio = ?)
-      LIMIT 1`,[start,duration,start,id_servicio]);
+      LIMIT 1`,[start,duration,start]);
     if(conflicts.length) {await conn.rollback();return res.status(409).json({error:'El horario se superpone con otro turno'});}
     const [result] = await conn.query('INSERT INTO turnos(fecha_hora,id_mascota,id_servicio,motivo) VALUES(?,?,?,?)',
-  [start, id_mascota, id_servicio, motivo||'']);
+      [start, id_mascota, id_servicio, motivo||'']);
     await conn.commit();res.status(201).json({id:result.insertId});
   }catch(e){await conn.rollback();console.error(e);res.status(500).json({error:'No se pudo guardar el turno'});}
-
 });
-
 
 // Cancelación lógica: se conserva el turno para trazabilidad.
 app.patch('/api/turnos/:id/cancelar', async(req,res)=>{
@@ -486,7 +613,7 @@ app.patch('/api/turnos/:id/cancelar', async(req,res)=>{
   }catch(e){console.error(e);return res.status(500).json({error:'No se pudo cancelar el turno'});}
 });
 
-// Reprogramación con la misma regla de dos agendas que la creación.
+// Reprogramación con la misma regla de validación que la creación.
 app.patch('/api/turnos/:id/reprogramar',async(req,res)=>{
   const id=Number(req.params.id);
   const {fecha,hora}=req.body||{};
@@ -505,98 +632,19 @@ app.patch('/api/turnos/:id/reprogramar',async(req,res)=>{
     if(!Number.isInteger(duracion)||duracion<=0){await conn.rollback();transaction=false;return res.status(400).json({error:'Duración inválida'});}
     const [feriados]=await conn.query('SELECT id_feriado FROM feriados WHERE dia_mes=?',[`${fecha.slice(8,10)}-${fecha.slice(5,7)}`]);
     if(feriados.length){await conn.rollback();transaction=false;return res.status(409).json({error:'No se reservan turnos en feriados fijos'});}
+
+    // Validación de día y horario de atención
+    const valHorario = await validarHorarioAtencion(conn, fecha, hora, duracion);
+    if (!valHorario.ok) {
+      await conn.rollback();
+      transaction = false;
+      return res.status(400).json({ error: valHorario.error });
+    }
+
     const [conflictos]=await conn.query(`SELECT t.id_turno FROM turnos t JOIN servicio s ON s.id_servicio=t.id_servicio
       WHERE t.estado='activo' AND t.id_turno<>? AND t.fecha_hora < DATE_ADD(?,INTERVAL ? MINUTE)
         AND DATE_ADD(t.fecha_hora,INTERVAL s.duracion_minutos MINUTE)>?
-        AND (LOWER(TRIM(s.descripcion)) IN ('baño','bano')) =
-            (SELECT LOWER(TRIM(descripcion)) IN ('baño','bano') FROM servicio WHERE id_servicio=?)
-      LIMIT 1`,[id,inicio,duracion,inicio,turnos[0].id_servicio]);
-    if(conflictos.length){await conn.rollback();transaction=false;return res.status(409).json({error:'El horario se superpone con otro turno'});}
-    await conn.query('UPDATE turnos SET fecha_hora=? WHERE id_turno=?',[inicio,id]);
-    await conn.commit();transaction=false;return res.json({ok:true});
-  }catch(e){if(transaction)try{await conn.rollback();}catch(err){console.error(err)}console.error(e);return res.status(500).json({error:'No se pudo reprogramar el turno'});}
-});
-
-
-// Cancelación lógica: se conserva el turno para trazabilidad.
-app.patch('/api/turnos/:id/cancelar', async(req,res)=>{
-  const id=Number(req.params.id);
-  if(!Number.isInteger(id)||id<=0)return res.status(400).json({error:'ID inválido'});
-  try{
-    const [result]=await db.promise().query("UPDATE turnos SET estado='cancelado' WHERE id_turno=? AND estado='activo'",[id]);
-    if(!result.affectedRows)return res.status(404).json({error:'Turno inexistente o ya cancelado'});
-    return res.json({ok:true});
-  }catch(e){console.error(e);return res.status(500).json({error:'No se pudo cancelar el turno'});}
-});
-
-// Reprogramación con la misma regla de dos agendas que la creación.
-app.patch('/api/turnos/:id/reprogramar',async(req,res)=>{
-  const id=Number(req.params.id);
-  const {fecha,hora}=req.body||{};
-  if(!Number.isInteger(id)||id<=0||typeof fecha!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(fecha)||
-     typeof hora!=='string'||!/^\d{2}:\d{2}$/.test(hora))
-    return res.status(400).json({error:'Fecha u hora inválida'});
-  const inicio=`${fecha} ${hora}:00`;
-  const conn=db.promise();let transaction=false;
-  try{
-    await conn.beginTransaction();transaction=true;
-    await conn.query('SELECT id_servicio FROM servicio ORDER BY id_servicio FOR UPDATE');
-    const [turnos]=await conn.query(`SELECT t.id_turno,t.id_servicio,s.duracion_minutos FROM turnos t
-      JOIN servicio s ON s.id_servicio=t.id_servicio WHERE t.id_turno=? AND t.estado='activo' FOR UPDATE`,[id]);
-    if(!turnos.length){await conn.rollback();transaction=false;return res.status(404).json({error:'Turno inexistente o cancelado'});}
-    const duracion=Number(turnos[0].duracion_minutos);
-    if(!Number.isInteger(duracion)||duracion<=0){await conn.rollback();transaction=false;return res.status(400).json({error:'Duración inválida'});}
-    const [feriados]=await conn.query('SELECT id_feriado FROM feriados WHERE dia_mes=?',[`${fecha.slice(8,10)}-${fecha.slice(5,7)}`]);
-    if(feriados.length){await conn.rollback();transaction=false;return res.status(409).json({error:'No se reservan turnos en feriados fijos'});}
-    const [conflictos]=await conn.query(`SELECT t.id_turno FROM turnos t JOIN servicio s ON s.id_servicio=t.id_servicio
-      WHERE t.estado='activo' AND t.id_turno<>? AND t.fecha_hora < DATE_ADD(?,INTERVAL ? MINUTE)
-        AND DATE_ADD(t.fecha_hora,INTERVAL s.duracion_minutos MINUTE)>?
-        AND (LOWER(TRIM(s.descripcion)) IN ('baño','bano')) =
-            (SELECT LOWER(TRIM(descripcion)) IN ('baño','bano') FROM servicio WHERE id_servicio=?)
-      LIMIT 1`,[id,inicio,duracion,inicio,turnos[0].id_servicio]);
-    if(conflictos.length){await conn.rollback();transaction=false;return res.status(409).json({error:'El horario se superpone con otro turno'});}
-    await conn.query('UPDATE turnos SET fecha_hora=? WHERE id_turno=?',[inicio,id]);
-    await conn.commit();transaction=false;return res.json({ok:true});
-  }catch(e){if(transaction)try{await conn.rollback();}catch(err){console.error(err)}console.error(e);return res.status(500).json({error:'No se pudo reprogramar el turno'});}
-});
-
-
-// Cancelación lógica: se conserva el turno para trazabilidad.
-app.patch('/api/turnos/:id/cancelar', async(req,res)=>{
-  const id=Number(req.params.id);
-  if(!Number.isInteger(id)||id<=0)return res.status(400).json({error:'ID inválido'});
-  try{
-    const [result]=await db.promise().query("UPDATE turnos SET estado='cancelado' WHERE id_turno=? AND estado='activo'",[id]);
-    if(!result.affectedRows)return res.status(404).json({error:'Turno inexistente o ya cancelado'});
-    return res.json({ok:true});
-  }catch(e){console.error(e);return res.status(500).json({error:'No se pudo cancelar el turno'});}
-});
-
-// Reprogramación con la misma regla de dos agendas que la creación.
-app.patch('/api/turnos/:id/reprogramar',async(req,res)=>{
-  const id=Number(req.params.id);
-  const {fecha,hora}=req.body||{};
-  if(!Number.isInteger(id)||id<=0||typeof fecha!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(fecha)||
-     typeof hora!=='string'||!/^\d{2}:\d{2}$/.test(hora))
-    return res.status(400).json({error:'Fecha u hora inválida'});
-  const inicio=`${fecha} ${hora}:00`;
-  const conn=db.promise();let transaction=false;
-  try{
-    await conn.beginTransaction();transaction=true;
-    await conn.query('SELECT id_servicio FROM servicio ORDER BY id_servicio FOR UPDATE');
-    const [turnos]=await conn.query(`SELECT t.id_turno,t.id_servicio,s.duracion_minutos FROM turnos t
-      JOIN servicio s ON s.id_servicio=t.id_servicio WHERE t.id_turno=? AND t.estado='activo' FOR UPDATE`,[id]);
-    if(!turnos.length){await conn.rollback();transaction=false;return res.status(404).json({error:'Turno inexistente o cancelado'});}
-    const duracion=Number(turnos[0].duracion_minutos);
-    if(!Number.isInteger(duracion)||duracion<=0){await conn.rollback();transaction=false;return res.status(400).json({error:'Duración inválida'});}
-    const [feriados]=await conn.query('SELECT id_feriado FROM feriados WHERE dia_mes=?',[`${fecha.slice(8,10)}-${fecha.slice(5,7)}`]);
-    if(feriados.length){await conn.rollback();transaction=false;return res.status(409).json({error:'No se reservan turnos en feriados fijos'});}
-    const [conflictos]=await conn.query(`SELECT t.id_turno FROM turnos t JOIN servicio s ON s.id_servicio=t.id_servicio
-      WHERE t.estado='activo' AND t.id_turno<>? AND t.fecha_hora < DATE_ADD(?,INTERVAL ? MINUTE)
-        AND DATE_ADD(t.fecha_hora,INTERVAL s.duracion_minutos MINUTE)>?
-        AND (LOWER(TRIM(s.descripcion)) IN ('baño','bano')) =
-            (SELECT LOWER(TRIM(descripcion)) IN ('baño','bano') FROM servicio WHERE id_servicio=?)
-      LIMIT 1`,[id,inicio,duracion,inicio,turnos[0].id_servicio]);
+      LIMIT 1`,[id,inicio,duracion,inicio]);
     if(conflictos.length){await conn.rollback();transaction=false;return res.status(409).json({error:'El horario se superpone con otro turno'});}
     await conn.query('UPDATE turnos SET fecha_hora=? WHERE id_turno=?',[inicio,id]);
     await conn.commit();transaction=false;return res.json({ok:true});
@@ -851,11 +899,59 @@ app.get('/api/configuracion', async (_req, res) => {
 // Días y horarios de atención (para el calendario de turnos)
 app.get('/api/dias-atencion', async (_req, res) => {
   try {
-    const [rows] = await db.promise().query('SELECT * FROM dias_atencion');
+    const [rows] = await db.promise().query(`
+      SELECT id_horario, dia_semana, hora_apertura, hora_cierre, activo,
+        CASE dia_semana
+          WHEN 'Domingo' THEN 0
+          WHEN 'Lunes' THEN 1
+          WHEN 'Martes' THEN 2
+          WHEN 'Miércoles' THEN 3
+          WHEN 'Jueves' THEN 4
+          WHEN 'Viernes' THEN 5
+          WHEN 'Sábado' THEN 6
+        END AS numero_dia
+      FROM dias_atencion
+      ORDER BY numero_dia ASC
+    `);
     res.json(rows);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Error al consultar los días de atención' });
+  }
+});
+
+// Actualizar configuración de días y horarios de atención
+app.put('/api/dias-atencion', async (req, res) => {
+  const dias = req.body;
+  if (!Array.isArray(dias) || dias.length === 0) {
+    return res.status(400).json({ error: 'Formato de días inválido' });
+  }
+  const conn = db.promise();
+  try {
+    await conn.beginTransaction();
+    for (const d of dias) {
+      const id = Number(d.id_horario);
+      const activo = d.activo ? 1 : 0;
+      const apertura = d.hora_apertura ? String(d.hora_apertura).slice(0, 8) : '00:00:00';
+      const cierre = d.hora_cierre ? String(d.hora_cierre).slice(0, 8) : '00:00:00';
+      if (id) {
+        await conn.query(
+          'UPDATE dias_atencion SET hora_apertura = ?, hora_cierre = ?, activo = ? WHERE id_horario = ?',
+          [apertura, cierre, activo, id]
+        );
+      } else if (d.dia_semana) {
+        await conn.query(
+          'UPDATE dias_atencion SET hora_apertura = ?, hora_cierre = ?, activo = ? WHERE dia_semana = ?',
+          [apertura, cierre, activo, d.dia_semana]
+        );
+      }
+    }
+    await conn.commit();
+    res.json({ ok: true, mensaje: 'Horarios de atención actualizados con éxito' });
+  } catch (e) {
+    await conn.rollback();
+    console.error(e);
+    res.status(500).json({ error: 'No se pudieron actualizar los horarios de atención' });
   }
 });
 

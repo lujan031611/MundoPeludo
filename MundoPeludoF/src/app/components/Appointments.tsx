@@ -1,13 +1,9 @@
-import { useTurnos, toIsoDate, slotAvailable, esBano } from "../hooks/useTurnos";
+import { useTurnos, toIsoDate, slotAvailable, generarSlotsDelDia } from "../hooks/useTurnos";
 import { useCatalogo, esFeriadoFijo, type Servicio, type Feriado } from "../hooks/useCatalogos";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Calendar, Clock, ChevronLeft, ChevronRight, AlertCircle, Info, CheckCircle } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
-
-interface TimeSlot {
-  time: string;
-  available: boolean;
-}
+import { obtenerDiasAtencion, obtenerTurnosDisponibles, type DiaAtencion } from "../../service/api";
 
 export default function Appointments() {
   const { currentUser, clients, pets } = useAuth();
@@ -21,6 +17,17 @@ export default function Appointments() {
   const [bookingError, setBookingError] = useState("");
   const [saving, setSaving] = useState(false);
   const {turnos,reload:reloadTurnos,error:turnosError}=useTurnos();
+  const [diasAtencion, setDiasAtencion] = useState<DiaAtencion[]>([]);
+  const [availableSlots, setAvailableSlots] = useState<string[]>([]);
+  const [loadingSlots, setLoadingSlots] = useState(false);
+
+  useEffect(() => {
+    obtenerDiasAtencion().then(data => {
+      if (Array.isArray(data) && data.length > 0) {
+        setDiasAtencion(data);
+      }
+    }).catch(console.error);
+  }, []);
 
   const { data: servicios, error: serviciosError } = useCatalogo<Servicio>("servicios");
   const { data: feriados, error: feriadosError } = useCatalogo<Feriado>("feriados");
@@ -30,25 +37,36 @@ export default function Appointments() {
   const myPets = isAdmin ? pets : currentUser?.clientId
     ? pets.filter(p => p.clientId === currentUser.clientId) : [];
 
-  const getTimeSlots = (): TimeSlot[] => {
-    const slots = [
-      "09:00", "09:30", "10:00", "10:30", "11:00", "11:30",
-      "12:00", "12:30", "14:00", "14:30", "15:00", "15:30",
-      "16:00", "16:30", "17:00", "17:30", "18:00", "18:30",
-    ];
-    const selected=servicios.find(s=>s.descripcion===selectedService);
-    // Sin servicio elegido, mostrar un horario si queda libre al menos una agenda.
-    const duration=selected ? Number(selected.duracion_minutos) : 30;
-    return slots.map(time => ({
-      time,
-      available: !turnosError && !!servicios.length && (selected
-        ? slotAvailable(selectedDate ? toIsoDate(selectedDate) : '', time, duration, turnos, selected.descripcion)
-        : servicios.some(servicio => slotAvailable(selectedDate ? toIsoDate(selectedDate) : '', time,
-            Number(servicio.duracion_minutos), turnos, servicio.descripcion)))
-    }));
-  };
+  // Consulta los horarios disponibles en el servidor (descartando automáticamente los ocupados por duración)
+  useEffect(() => {
+    if (!selectedDate) {
+      setAvailableSlots([]);
+      return;
+    }
+    const isoDate = toIsoDate(selectedDate);
+    if (!isoDate) {
+      setAvailableSlots([]);
+      return;
+    }
 
-  const timeSlots = getTimeSlots();
+    const servicioObj = servicios.find(s => s.descripcion === selectedService);
+    setLoadingSlots(true);
+
+    obtenerTurnosDisponibles(isoDate, servicioObj?.id_servicio)
+      .then(slots => {
+        setAvailableSlots(slots);
+        if (selectedTime && !slots.includes(selectedTime)) {
+          setSelectedTime(null);
+        }
+      })
+      .catch(err => {
+        console.error(err);
+        setAvailableSlots([]);
+      })
+      .finally(() => {
+        setLoadingSlots(false);
+      });
+  }, [selectedDate, selectedService, turnos, servicios]);
 
   const getDaysInMonth = (date: Date) => {
     const year = date.getFullYear();
@@ -78,12 +96,11 @@ export default function Appointments() {
       day
     );
 
-    // d.getDay() te devuelve el día de la semana (0 = Domingo, 1 = Lunes, ..., 6 = Sábado)
-    // Aquí puedes validar si el día está permitido según tus días de atención
     const diaSemana = d.getDay();
-    const esDomingo = diaSemana === 0; // Si en tu BD el domingo está inactivo
+    const configDia = diasAtencion.find(da => da.numero_dia === diaSemana);
+    const diaHabilitado = configDia !== undefined ? Boolean(configDia.activo) : diaSemana !== 0;
 
-    return d >= today && d <= twoMonthsLater && !esFeriado(d) && !esDomingo;
+    return d >= today && d <= twoMonthsLater && !esFeriado(d) && diaHabilitado;
   };
 
   const handleDateClick = (day: number) => {
@@ -185,22 +202,40 @@ export default function Appointments() {
           </div>
           {selectedDate && (
             <div className="mt-6">
-              <h3 className="mb-3 text-gray-900 flex items-center gap-2"><Clock className="w-5 h-5" />Horarios — {selectedDate}</h3>
-              {turnosError && <p className="mb-2 text-red-600 text-sm">No se pudo consultar la disponibilidad. Volvé a intentarlo antes de reservar.</p>}
-              <div className="grid grid-cols-4 gap-2">
-                {timeSlots.map(slot => (
-                  <button key={slot.time} onClick={() => slot.available && setSelectedTime(slot.time)} disabled={!slot.available}
-                    className={`px-3 py-2 rounded-lg transition-colors text-sm ${
-                      !slot.available ? "bg-gray-300 text-gray-500 cursor-not-allowed" : selectedTime === slot.time ? "bg-green-600 text-white" : "bg-gray-100 hover:bg-gray-200 text-gray-900"
-                    }`}>
-                    {slot.time}
-                  </button>
-                ))}
-              </div>
-              <div className="flex items-center gap-4 mt-3 text-sm">
-                <div className="flex items-center gap-2"><div className="w-4 h-4 bg-gray-100 rounded" /><span className="text-gray-600">Disponible</span></div>
-                <div className="flex items-center gap-2"><div className="w-4 h-4 bg-gray-300 rounded" /><span className="text-gray-600">Ocupado</span></div>
-              </div>
+              <h3 className="mb-3 text-gray-900 flex items-center gap-2">
+                <Clock className="w-5 h-5 text-blue-600" />
+                Horarios Disponibles — {selectedDate}
+              </h3>
+              {selectedServiceDetails && (
+                <p className="text-xs text-blue-600 mb-3 font-medium">
+                  Horarios calculados para {selectedService} ({selectedServiceDetails.duration})
+                </p>
+              )}
+              {loadingSlots ? (
+                <p className="text-sm text-gray-500 py-3">Consultando horarios disponibles...</p>
+              ) : availableSlots.length > 0 ? (
+                <div className="grid grid-cols-4 gap-2">
+                  {availableSlots.map(time => (
+                    <button
+                      key={time}
+                      onClick={() => setSelectedTime(time)}
+                      className={`px-3 py-2 rounded-lg transition-colors text-sm font-medium ${
+                        selectedTime === time
+                          ? "bg-green-600 text-white shadow-sm"
+                          : "bg-blue-50 hover:bg-blue-100 text-blue-900 border border-blue-200"
+                      }`}
+                    >
+                      {time}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-sm">
+                  {selectedService
+                    ? `No hay turnos disponibles para el servicio de ${selectedService} en esta fecha. Por favor, selecciona otro día.`
+                    : 'No hay horarios disponibles para esta fecha. Por favor, selecciona otro día.'}
+                </div>
+              )}
             </div>
           )}
         </div>
